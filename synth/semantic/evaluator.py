@@ -57,7 +57,11 @@ class DSLEvaluator(Evaluator):
                 elif isinstance(sub_prog, Function):
                     fun = evaluations[sub_prog.function]
                     for arg in sub_prog.arguments:
-                        fun = fun(evaluations[arg])
+                        # print("\trecall=", arg, "is", evaluations[arg])
+                        try:
+                            fun = fun(evaluations[arg])
+                        except:
+                            return None
                     evaluations[sub_prog] = fun
         except Exception as e:
             if type(e) in self.skip_exceptions:
@@ -65,7 +69,6 @@ class DSLEvaluator(Evaluator):
                 return None
             else:
                 raise e
-
         return evaluations[program]
 
     def clear_cache(self) -> None:

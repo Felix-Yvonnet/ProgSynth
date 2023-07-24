@@ -252,7 +252,9 @@ def produce_pcfgs(
                 obj.to_prob_u_grammar() if constrained else obj.to_prob_det_grammar()
             )
     pbar.close()
-    save_pcfgs()
+    print("pcfg built")
+    # save_pcfgs()
+    print("pcfg saved")
     atexit.unregister(save_pcfgs)
     del predictor
     free_pytorch_memory()
@@ -318,6 +320,63 @@ def enumerative_search(
     pbar.close()
 
 
+
+def save_evaluate(data, task):
+     with open("/home/felixyvonnet/Stage/ProgSynth/random_file.csv",  
+"a") as fd:
+         fd.write(";")
+         fd.write(str(len(task.specification.examples)))
+         fd.write(":")
+         for d in data:
+             fd.write(str(d[0]))
+             fd.write(",")
+             fd.write(str(d[1]))
+             fd.write("\n")
+
+
+def base2(
+     evaluator: DSLEvaluator,
+     task: Task[PBE],
+     pcfg: Union[ProbDetGrammar, ProbUGrammar],
+     custom_enumerate: Callable[[Union[ProbDetGrammar, ProbUGrammar]],  
+HSEnumerator],
+) -> Tuple[bool, float, int, Optional[Program]]:
+     time = 0.0
+     programs = 0
+     with chrono.clock("search.base") as c:
+         data = []
+
+         for program in custom_enumerate(pcfg):
+             time = c.elapsed_time()
+             if time >= task_timeout:
+                 save_evaluate(data, task)
+                 return (False, time, programs, None, None)
+             programs += 1
+             failed = False
+             failed_no = 0
+             for ex in task.specification.examples:
+                 if evaluator.eval(program, ex.inputs) != ex.output:
+                     failed = True
+                     failed_no += 1
+
+             data += [(pcfg.probability(program),  
+len(task.specification.examples) - failed_no, program)]
+
+             if not failed:
+                 save_evaluate(data, task)
+                 return (
+                     True,
+                     c.elapsed_time(),
+                     programs,
+                     program,
+                     pcfg.probability(program),
+                 )
+     save_evaluate(data, task)
+     return (False, time, programs, None, None)
+
+
+
+
 def base(
     evaluator: DSLEvaluator,
     task: Task[PBE],
@@ -327,7 +386,6 @@ def base(
     time = 0.0
     programs = 0
     with chrono.clock("search.base") as c:
-
         for program in custom_enumerate(pcfg):
             time = c.elapsed_time()
             if time >= task_timeout:
@@ -650,6 +708,7 @@ if __name__ == "__main__":
     #     name = "constants_injector"
 
     pcfgs = produce_pcfgs(full_dataset, dsl, lexicon, constraints)
+    print("pcfg saved")
     file = os.path.join(
         output_folder, f"{dataset_name}_{model_name}_{search_algo}_{name}.csv"
     )
@@ -668,6 +727,8 @@ if __name__ == "__main__":
                 int(len(trace) * 100 / len(full_dataset)),
                 "%)",
             )
+    
+    print("pcfg written")
     enumerative_search(full_dataset, evaluator, pcfgs, trace, method, custom_enumerate)
     save(trace)
     print("csv file was saved as:", file)
