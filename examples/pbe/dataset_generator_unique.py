@@ -82,6 +82,11 @@ uniform: bool = parameters.uniform
 constrained: bool = parameters.constrained
 verbose: bool = parameters.verbose
 
+if constrained and not uniform:
+    raise NotImplementedError(
+        "Constrained grammars when uniform=False is currently not implemented!"
+    )
+
 # ================================
 # Load constants specific to DSL
 # ================================
@@ -171,13 +176,17 @@ def generate_programs_and_samples_for(
             prog, unique = task_generator.generate_program(tr)
         # Compute semantic hash
         cl = None
+        has_none = False
         for x in samples:
             o = task_generator.eval_input(prog, x)
+            if o is None:
+                has_none = True
+                break
             if isinstance(o, List):
                 o = tuple(o)
             cl = (o, cl)
         # Check
-        if cl not in equiv:
+        if cl not in equiv and not has_none:
             equiv[cl].append(prog)
             tries = 0
             pbar.update(1)
@@ -210,6 +219,7 @@ def generate_programs_and_samples_for(
             ]
             for x in out
         ]
+    del task_generator.type2pgrammar[tr]
     return out, rel_programs
 
 
@@ -226,22 +236,25 @@ def generate_samples_for(
     equiv_classes = {None: programs}
     nb_examples = 0
     nb_tested = 0
-    pbar = tqdm.tqdm(total=examples * threshold, desc="2: sem. unicity")
+    pbar = tqdm.tqdm(total=examples * abs(threshold), desc="2: sem. unicity")
     best = None
     best_score = 0
     while nb_examples < examples:
         next_equiv_classes = defaultdict(list)
         clear_cache()
         thres_reached = nb_tested * nb_tested > threshold * threshold
-        ui = best if thres_reached else input_sampler()
+        ui = best if thres_reached and best is not None else input_sampler()
+        failed_ratio = 0
         for cl, prog in equiv_classes.items():
             for p in prog:
                 o = eval_prog(p, ui)
+                if not task_generator.output_validator(o):
+                    failed_ratio += 1
                 if isinstance(o, List):
                     o = tuple(o)
                 next_equiv_classes[(o, cl)].append(p)
-        ratio = len(next_equiv_classes) / len(equiv_classes)
-        if len(next_equiv_classes) > best_score:
+        ratio = len(programs) / len(equiv_classes)
+        if len(next_equiv_classes) > best_score and failed_ratio / len(programs) < 0.2:
             best = ui
             best_score = len(next_equiv_classes)
         # Early stopping if no new examples is interesting
@@ -259,7 +272,8 @@ def generate_samples_for(
             equiv_classes = next_equiv_classes
             samples.append(ui)
             best_score = len(next_equiv_classes)
-            pbar.n = nb_examples * threshold
+            pbar.n = nb_examples * abs(threshold)
+            pbar.refresh()
         pbar.set_postfix_str(
             f"{len(equiv_classes)}->{best_score} | {best_score/len(programs):.0%}"
         )

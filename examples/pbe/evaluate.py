@@ -4,7 +4,6 @@ import os
 import sys
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 import csv
-import pickle
 
 import tqdm
 
@@ -54,6 +53,17 @@ parser.add_argument(
     default="heap_search",
     help="enumeration algorithm (default: heap_search)",
 )
+parser.add_argument(
+    "--method",
+    type=str,
+    default="base2",
+    help="used method (default: base)",
+)
+parser.add_argument(
+    "--predict",
+    action="store_true",
+    help="only do the PCFG prediction part",
+)
 add_dsl_choice_arg(parser)
 add_model_choice_arg(parser)
 parser.add_argument(
@@ -82,11 +92,13 @@ parameters = parser.parse_args()
 dsl_name: str = parameters.dsl
 dataset_file: str = parameters.dataset
 search_algo: str = parameters.search
+method: str = parameters.method
 output_folder: str = parameters.output
 model_file: str = parameters.model
 task_timeout: float = parameters.timeout
 batch_size: int = parameters.batch_size
 constrained: bool = parameters.constrained
+predict_only: bool = parameters.predict
 support: Optional[str] = (
     None if not parameters.support else parameters.support.format(dsl_name=dsl_name)
 )
@@ -225,14 +237,16 @@ def produce_pcfgs(
     ]
 
     predictor = instantiate_predictor(parameters, cfgs, lexicon)
-    predictor.load_state_dict(torch.load(model_file))
+    predictor.load_state_dict(torch.load(model_file, map_location=device))
     predictor = predictor.to(device)
     predictor.eval()
     # ================================
     # Predict PCFG
     # ================================
     def save_pcfgs() -> None:
+        print("Saving PCFGs...", end="")
         save_object(file, pcfgs)
+        print("done!")
 
     atexit.register(save_pcfgs)
 
@@ -256,6 +270,8 @@ def produce_pcfgs(
     # save_pcfgs()
     print("pcfg saved")
     atexit.unregister(save_pcfgs)
+    if predict_only:
+        return pcfgs
     del predictor
     free_pytorch_memory()
     return pcfgs
@@ -407,16 +423,15 @@ def base(
     return (False, time, programs, None, None)
 
 
-def semantic_equivalence(
+def semantic_base(
     evaluator: DSLEvaluator,
     task: Task[PBE],
     pcfg: Union[ProbDetGrammar, ProbUGrammar],
     custom_enumerate: Callable[[Union[ProbDetGrammar, ProbUGrammar]], HSEnumerator],
-) -> Tuple[bool, float, int, Optional[Program]]:
+) -> Tuple[bool, float, int, Optional[Program], Optional[float]]:
     time = 0.0
     programs = 0
-    with chrono.clock("search.semantic_equivalence") as c:
-        results = {}
+    with chrono.clock("search.semantic_base") as c:
         enumerator = custom_enumerate(pcfg)
         for program in enumerator:
             time = c.elapsed_time()
@@ -424,14 +439,9 @@ def semantic_equivalence(
                 return (False, time, programs, None, None)
             programs += 1
             failed = False
-            outputs = []
             for ex in task.specification.examples:
                 out = evaluator.eval(program, ex.inputs)
-                if out != ex.output:
-                    failed = True
-                    if program.depth() > 2:
-                        break
-                    outputs.append(tuple(out))
+                failed = failed or out != ex.output
             if not failed:
                 return (
                     True,
@@ -440,13 +450,51 @@ def semantic_equivalence(
                     program,
                     pcfg.probability(program),
                 )
-            elif len(outputs) > 0:
-                original = results.get(tuple(outputs))
+    return (False, time, programs, None, None)
+
+
+def semantic_equivalence(
+    evaluator: DSLEvaluator,
+    task: Task[PBE],
+    pcfg: Union[ProbDetGrammar, ProbUGrammar],
+    custom_enumerate: Callable[[Union[ProbDetGrammar, ProbUGrammar]], HSEnumerator],
+) -> Tuple[bool, float, int, Optional[Program], Optional[float]]:
+    time = 0.0
+    programs = 0
+    with chrono.clock("search.semantic_equivalence") as c:
+        results = {}
+        enumerator = custom_enumerate(pcfg)
+        merged = 0
+        for program in enumerator:
+            time = c.elapsed_time()
+            if time >= task_timeout:
+                return (False, time, programs, None, None)
+            programs += 1
+            failed = False
+            outputs = None
+            for ex in task.specification.examples:
+                out = evaluator.eval(program, ex.inputs)
+                failed |= out != ex.output
+                if isinstance(out, list):
+                    outputs = (outputs, tuple(out))
+                else:
+                    outputs = (outputs, out)
+            if not failed:
+                return (
+                    True,
+                    c.elapsed_time(),
+                    programs,
+                    program,
+                    merged,
+                )
+            else:
+                original = results.get(outputs)
                 if original is not None:
                     enumerator.merge_program(original, program)
+                    merged += 1
                 else:
-                    results[tuple(outputs)] = program
-    return (False, time, programs, None, None)
+                    results[outputs] = program
+    return (False, time, programs, None, merged)
 
 
 def constants_injector(
@@ -701,34 +749,38 @@ if __name__ == "__main__":
         model_name,
         constraints,
     ) = load_dsl_and_dataset()
-    method = base
-    name = "base"
-    # if isinstance(evaluator, DSLEvaluatorWithConstant):
-    #     method = constants_injector
-    #     name = "constants_injector"
+
+    METHODS = {
+        "base": base,
+        "sem.equiv": semantic_equivalence,
+        "sem.base": semantic_base,
+        "wikicoder": sketched_base,
+        "constant": constants_injector,
+    }
+    method_fn = METHODS[method]
 
     pcfgs = produce_pcfgs(full_dataset, dsl, lexicon, constraints)
-    print("pcfg saved")
-    file = os.path.join(
-        output_folder, f"{dataset_name}_{model_name}_{search_algo}_{name}.csv"
-    )
-    trace = []
-    if os.path.exists(file):
-        with open(file, "r") as fd:
-            reader = csv.reader(fd)
-            trace = [tuple(row) for row in reader]
-            trace.pop(0)
-            print(
-                "\tLoaded",
-                len(trace),
-                "/",
-                len(full_dataset),
-                "(",
-                int(len(trace) * 100 / len(full_dataset)),
-                "%)",
-            )
-    
-    print("pcfg written")
-    enumerative_search(full_dataset, evaluator, pcfgs, trace, method, custom_enumerate)
-    save(trace)
-    print("csv file was saved as:", file)
+    if not predict_only:
+        file = os.path.join(
+            output_folder, f"{dataset_name}_{model_name}_{search_algo}_{method}.csv"
+        )
+        trace = []
+        if os.path.exists(file):
+            with open(file, "r") as fd:
+                reader = csv.reader(fd)
+                trace = [tuple(row) for row in reader]
+                trace.pop(0)
+                print(
+                    "\tLoaded",
+                    len(trace),
+                    "/",
+                    len(full_dataset),
+                    "(",
+                    int(len(trace) * 100 / len(full_dataset)),
+                    "%)",
+                )
+        enumerative_search(
+            full_dataset, evaluator, pcfgs, trace, method_fn, custom_enumerate
+        )
+        save(trace)
+        print("csv file was saved as:", file)
