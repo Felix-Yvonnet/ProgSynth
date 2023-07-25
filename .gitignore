@@ -25,6 +25,9 @@ docs/build
 # csv files
 *.csv
 
+# json files
+*.json
+
 # model files
 *.pt
 
